@@ -5,9 +5,7 @@ pub(crate) use crate::core::retriever::MIN_FAILURE_BYTES as MIN_TEE_SIZE;
 use crate::core::retriever::{self, RecoveryMode, RetrieverConfig, Stored, MIN_FAILURE_BYTES};
 
 fn active() -> Option<(RecoveryMode, RetrieverConfig)> {
-    if matches!(std::env::var("RTK_RECALL").ok().as_deref(), Some("0"))
-        || matches!(std::env::var("RTK_TEE").ok().as_deref(), Some("0"))
-    {
+    if retriever::recovery_disabled_by_env() {
         return None;
     }
     match Config::load().ok().map(|c| (c.retriever.mode, c.retriever)) {
@@ -29,10 +27,13 @@ fn store_hint(
 }
 
 pub fn tee_and_hint(raw: &str, command_slug: &str, exit_code: i32) -> Option<String> {
-    if exit_code == 0 || raw.len() < MIN_FAILURE_BYTES {
+    if raw.len() < MIN_FAILURE_BYTES {
         return None;
     }
     let (mode, cfg) = active()?;
+    if exit_code == 0 && !cfg.tee_on_success {
+        return None;
+    }
     match mode {
         RecoveryMode::Disabled => None,
         RecoveryMode::Tee => super::tee_file::tee_and_hint(&cfg, raw, command_slug)
@@ -87,6 +88,7 @@ mod tests {
 
     #[test]
     fn test_disabled_env_emits_nothing() {
+        let _guard = crate::core::utils::TEST_ENV_LOCK.lock().unwrap();
         std::env::set_var("RTK_RECALL", "0");
         let big = "x".repeat(1000);
         let hint = tee_and_hint(&big, "cmd", 1);

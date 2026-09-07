@@ -43,6 +43,7 @@ pub struct RetrieverConfig {
     pub tee_max_file_size: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tee_directory: Option<PathBuf>,
+    pub tee_on_success: bool,
 }
 
 impl Default for RetrieverConfig {
@@ -57,6 +58,7 @@ impl Default for RetrieverConfig {
             tee_max_files: DEFAULT_TEE_MAX_FILES,
             tee_max_file_size: DEFAULT_TEE_MAX_FILE_SIZE,
             tee_directory: None,
+            tee_on_success: false,
         }
     }
 }
@@ -142,10 +144,10 @@ fn grep_bytes(input: &[u8], pattern: &str) -> Vec<u8> {
         return input.to_vec();
     };
     let mut out = Vec::new();
-    for line in input.split(|&b| b == b'\n') {
-        if re.is_match(line) {
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        if re.is_match(body) {
             out.extend_from_slice(line);
-            out.push(b'\n');
         }
     }
     out
@@ -189,6 +191,24 @@ fn open(cfg: &RetrieverConfig) -> Result<Connection> {
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;");
     init_schema(&conn)?;
     Ok(conn)
+}
+
+thread_local! {
+    static CONN_CACHE: std::cell::RefCell<Option<(PathBuf, Connection)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn with_open<T>(cfg: &RetrieverConfig, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let path = db_path(cfg)?;
+    CONN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let reuse = matches!(&*cache, Some((p, _)) if *p == path && path.exists());
+        if !reuse {
+            *cache = Some((path.clone(), open(cfg)?));
+        }
+        let (_, conn) = cache.as_ref().expect("cache populated above");
+        f(conn)
+    })
 }
 
 fn open_existing(cfg: &RetrieverConfig) -> Result<Option<Connection>> {
@@ -337,9 +357,10 @@ pub fn record_tee_elision(cfg: &RetrieverConfig, slug: &str) {
     if cfg.mode == RecoveryMode::Disabled {
         return;
     }
-    if let Ok(conn) = open(cfg) {
-        bump_stat(&conn, slug, "tee", "elisions");
-    }
+    let _ = with_open(cfg, |conn| {
+        bump_stat(conn, slug, "tee", "elisions");
+        Ok(())
+    });
 }
 
 fn mark_recalled(conn: &Connection, hash: &str, command: &str) {
@@ -372,19 +393,24 @@ fn record_tee_recall_on(conn: &Connection, slug: &str, path: &str) {
     }
 }
 
-pub fn record_tee_recall(slug: &str, path: &str) {
-    if matches!(std::env::var("RTK_RECALL").ok().as_deref(), Some("0"))
+pub(crate) fn recovery_disabled_by_env() -> bool {
+    matches!(std::env::var("RTK_RECALL").ok().as_deref(), Some("0"))
         || matches!(std::env::var("RTK_TEE").ok().as_deref(), Some("0"))
-    {
+}
+
+fn record_tee_recall_with(cfg: &RetrieverConfig, slug: &str, path: &str) {
+    if recovery_disabled_by_env() || cfg.mode == RecoveryMode::Disabled {
         return;
     }
+    let _ = with_open(cfg, |conn| {
+        record_tee_recall_on(conn, slug, path);
+        Ok(())
+    });
+}
+
+pub fn record_tee_recall(slug: &str, path: &str) {
     let cfg = Config::load().unwrap_or_default().retriever;
-    if cfg.mode == RecoveryMode::Disabled {
-        return;
-    }
-    if let Ok(conn) = open(&cfg) {
-        record_tee_recall_on(&conn, slug, path);
-    }
+    record_tee_recall_with(&cfg, slug, path);
 }
 
 fn evict(conn: &Connection, cfg: &RetrieverConfig, keep_hash: &str) {
@@ -460,8 +486,8 @@ fn store_inner(
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
 
-    let conn = open(cfg)?;
-    conn.execute(
+    with_open(cfg, |conn| {
+        conn.execute(
         "INSERT INTO recall
          (hash, command, cwd, exit_code, created_at, total_lines, shown_upto, byte_size, truncated, codec, blob)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -491,12 +517,13 @@ fn store_inner(
         ],
     )
     .context("insert recall row")?;
-    bump_stat(&conn, command, "sqlite", "elisions");
-    evict(&conn, cfg, &hash);
+        bump_stat(conn, command, "sqlite", "elisions");
+        evict(conn, cfg, &hash);
 
-    Ok(StoredRef {
-        hash,
-        hidden_lines: total_lines.saturating_sub(shown_upto.saturating_sub(1)),
+        Ok(StoredRef {
+            hash: hash.clone(),
+            hidden_lines: total_lines.saturating_sub(shown_upto.saturating_sub(1)),
+        })
     })
 }
 
@@ -736,6 +763,14 @@ mod tests {
     }
 
     #[test]
+    fn test_grep_match_all_roundtrips_byte_exact() {
+        let input = b"a\nb\nc\n".to_vec();
+        assert_eq!(grep_bytes(&input, "^"), input);
+        let no_trailing = b"a\nb\nno-eol".to_vec();
+        assert_eq!(grep_bytes(&no_trailing, "^"), no_trailing);
+    }
+
+    #[test]
     fn test_grep_bytes() {
         let input = b"alpha\nbeta\ngamma\n";
         assert_eq!(grep_bytes(input, "et"), b"beta\n");
@@ -897,8 +932,16 @@ mod tests {
             store_inner(&cfg, format!("mid{i}\n").as_bytes(), "cmd", Some(1), 1).unwrap();
         }
         let conn = open(&cfg).unwrap();
-        conn.execute("UPDATE recall SET created_at = created_at - 100 WHERE hash != ?1", params![old.hash]).unwrap();
-        conn.execute("UPDATE recall SET created_at = created_at + 50 WHERE hash = ?1", params![old.hash]).unwrap();
+        conn.execute(
+            "UPDATE recall SET created_at = created_at - 100 WHERE hash != ?1",
+            params![old.hash],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE recall SET created_at = created_at + 50 WHERE hash = ?1",
+            params![old.hash],
+        )
+        .unwrap();
         drop(conn);
         store_inner(&cfg, b"newest\n", "cmd", Some(1), 1).unwrap();
         let conn = open(&cfg).unwrap();
@@ -1026,17 +1069,22 @@ mod tests {
 
     #[test]
     fn test_record_tee_recall_respects_kill_switch() {
+        let _guard = crate::core::utils::TEST_ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("guard.db");
-        std::env::set_var("RTK_RECALL_DB", &db);
+        let cfg = temp_cfg(dir.path());
         std::env::set_var("RTK_RECALL", "0");
-        record_tee_recall("grep", "/tee/1_grep.log");
+        record_tee_recall_with(&cfg, "grep", "/tee/1_grep.log");
         std::env::remove_var("RTK_RECALL");
-        std::env::remove_var("RTK_RECALL_DB");
         assert!(
-            !db.exists(),
+            !dir.path().join("recall_test.db").exists(),
             "RTK_RECALL=0 must prevent any recall.db write from the hook path"
         );
+        let disabled = RetrieverConfig {
+            mode: RecoveryMode::Disabled,
+            ..temp_cfg(dir.path())
+        };
+        record_tee_recall_with(&disabled, "grep", "/tee/1_grep.log");
+        assert!(!dir.path().join("recall_test.db").exists());
     }
 
     #[test]
