@@ -1387,7 +1387,7 @@ rtk config recall <mode>     # Changer de mode sans editer la config (sqlite|tee
 ```
 
 `rtk gain --recalls` separe strictement les donnees par mode : taux exact en sqlite
-(la lecture passe par `rtk recall`), borne inferieure (`≥`) en tee (seules les lectures
+(la lecture passe par `rtk recall`), approximation (`≥`) en tee (seules les lectures
 bash sont detectables via le hook, pas l'outil Read). Un taux eleve signale un filtre
 qui cache des sorties que l'agent revient chercher.
 

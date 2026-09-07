@@ -41,12 +41,13 @@ ignore_files = ["*.lock", "*.min.js", "*.min.css"]
 [retriever]
 mode = "sqlite"             # sqlite (default) | tee (legacy files) | disabled
 max_entry_bytes = 10485760  # sqlite: 10 MiB per entry
-max_entries = 200           # sqlite: FIFO cap
-retention_days = 30         # sqlite: 0 disables age eviction
+max_entries = 200           # sqlite: FIFO cap (0 = no cap)
+retention_days = 30         # sqlite: age eviction (0 = off)
 compression = true          # sqlite: gzip blobs (lossless)
 # database_path = "/custom/recall.db"
 tee_max_files = 20          # tee mode: rotation
 tee_max_file_size = 1048576 # tee mode: per-file cap
+# tee_on_success = true     # also store successful outputs (legacy "always")
 # tee_directory = "/custom/tee/dir"
 
 [telemetry]
@@ -101,7 +102,7 @@ To see how often your assistant actually goes back for elided output — and whi
 |---------|---------|-------------|
 | `retriever.mode` | `"sqlite"` | `sqlite` (default), `tee` (legacy files), `disabled` |
 | `retriever.max_entry_bytes` | `10485760` | Per-entry storage cap (10 MiB) |
-| `retriever.max_entries` | `200` | FIFO cap on retained entries |
+| `retriever.max_entries` | `200` | FIFO cap on retained entries (0 = no cap) |
 | `retriever.retention_days` | `30` | Age eviction in days (0 = off) |
 | `retriever.compression` | `true` | gzip stored blobs (lossless) |
 | Max file size | 1 MB | Truncated above this |

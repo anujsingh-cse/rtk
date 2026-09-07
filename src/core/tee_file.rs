@@ -82,6 +82,14 @@ pub fn legacy_tee_config_in_use() -> bool {
         .unwrap_or(false)
 }
 
+pub const LEGACY_TEE_MERGED_NOTICE: &str = "Legacy [tee] values are still applied alongside your [retriever] section.\nMove them to [retriever] (tee_max_files, tee_max_file_size, tee_directory)\nand remove the [tee] section.";
+
+pub fn legacy_tee_fields_merged_in_use() -> bool {
+    Config::load()
+        .map(|c| c.legacy_tee_fields_merged)
+        .unwrap_or(false)
+}
+
 pub(crate) fn resolved_tee_dir() -> Option<PathBuf> {
     let cfg = Config::load().ok()?.retriever;
     get_tee_dir(&cfg)

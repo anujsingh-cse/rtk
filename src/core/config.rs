@@ -19,6 +19,8 @@ pub struct Config {
     tee: Option<LegacyTeeConfig>,
     #[serde(skip)]
     pub migrated_from_legacy_tee: bool,
+    #[serde(skip)]
+    pub legacy_tee_fields_merged: bool,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
@@ -231,27 +233,37 @@ impl Config {
         let explicit = |key: &str| explicit_retriever_keys.iter().any(|k| k == key);
         let r = &mut self.retriever;
         if !has_retriever {
-            self.migrated_from_legacy_tee = true;
             if tee.enabled == Some(false) || tee.mode.as_deref() == Some("never") {
                 r.mode = RecoveryMode::Disabled;
             } else {
                 r.mode = RecoveryMode::Tee;
+                self.migrated_from_legacy_tee = true;
+            }
+            if tee.mode.as_deref() == Some("always") && !explicit("tee_on_success") {
+                r.tee_on_success = true;
             }
         }
+        let mut merged = false;
         if let Some(v) = tee.max_files {
             if !explicit("tee_max_files") {
                 r.tee_max_files = v;
+                merged = true;
             }
         }
         if let Some(v) = tee.max_file_size {
             if !explicit("tee_max_file_size") {
                 r.tee_max_file_size = v;
+                merged = true;
             }
         }
         if let Some(d) = tee.directory {
             if !explicit("tee_directory") {
                 r.tee_directory = Some(d);
+                merged = true;
             }
+        }
+        if has_retriever && merged {
+            self.legacy_tee_fields_merged = true;
         }
     }
 
@@ -305,6 +317,14 @@ fn apply_recall_mode(content: &str, mode: crate::core::retriever::RecoveryMode) 
                     doc["retriever"][new_key] = toml_edit::Item::Value(v.clone());
                 }
             }
+        }
+        let was_always = legacy
+            .get("mode")
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+            == Some("always");
+        if was_always && doc["retriever"].get("tee_on_success").is_none() {
+            doc["retriever"]["tee_on_success"] = toml_edit::value(true);
         }
     }
     Ok(doc.to_string())
@@ -549,6 +569,40 @@ enabled = false
         let toml = "[retriever]\ntee_max_files = 5\n\n[tee]\nmax_files = 100\n";
         let config = Config::from_toml(toml).expect("valid");
         assert_eq!(config.retriever.tee_max_files, 5);
+    }
+
+    #[test]
+    fn test_legacy_always_mode_maps_to_tee_on_success() {
+        use crate::core::retriever::RecoveryMode;
+        let config = Config::from_toml("[tee]\nmode = \"always\"\n").expect("valid");
+        assert_eq!(config.retriever.mode, RecoveryMode::Tee);
+        assert!(
+            config.retriever.tee_on_success,
+            "always behavior must be preserved"
+        );
+        let plain = Config::from_toml("[tee]\nenabled = true\n").expect("valid");
+        assert!(!plain.retriever.tee_on_success);
+    }
+
+    #[test]
+    fn test_notice_flags_track_migration_outcome() {
+        let disabled = Config::from_toml("[tee]\nenabled = false\n").expect("valid");
+        assert!(
+            !disabled.migrated_from_legacy_tee,
+            "a user who disabled tee must not get the file-mode-kept notice"
+        );
+        let kept = Config::from_toml("[tee]\nenabled = true\n").expect("valid");
+        assert!(kept.migrated_from_legacy_tee);
+        let merged =
+            Config::from_toml("[retriever]\nretention_days = 90\n\n[tee]\nmax_files = 100\n")
+                .expect("valid");
+        assert!(
+            merged.legacy_tee_fields_merged,
+            "coexisting legacy values still in effect must be disclosed"
+        );
+        assert!(!merged.migrated_from_legacy_tee);
+        let clean = Config::from_toml("[retriever]\nmode = \"sqlite\"\n").expect("valid");
+        assert!(!clean.legacy_tee_fields_merged);
     }
 
     #[test]

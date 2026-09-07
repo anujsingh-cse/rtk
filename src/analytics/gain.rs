@@ -508,11 +508,7 @@ fn show_recall_stats() -> Result<()> {
     };
 
     render("Sqlite (exact — reads go through rtk recall)", "sqlite", "");
-    render(
-        "Tee (lower bound — bash reads only, Read tool invisible)",
-        "tee",
-        "≥",
-    );
+    render("Tee (approximate — bash-observed reads only)", "tee", "≥");
 
     println!("A high rate means the filter hides output the agent goes back for:");
     println!("consider raising that filter's cap.");

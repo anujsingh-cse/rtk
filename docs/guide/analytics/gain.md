@@ -217,7 +217,7 @@ FILTER                   ELISIONS RECALLED   RATE
 vitest                         67       29    43%
 docker-images                 142        3     2%
 
-TEE (lower bound — bash reads only, Read tool invisible)
+TEE (approximate — bash-observed reads only)
 FILTER                   ELISIONS RECALLED   RATE
 cargo_test                     38        4   ≥10%
 ```
@@ -231,7 +231,7 @@ How to read it:
 The two sections are never merged because the data quality differs:
 
 - **SQLITE (exact)**: reads go through `rtk recall <hash>`, the only access path, so the count is exact.
-- **TEE (lower bound)**: in legacy [tee mode](../getting-started/configuration.md#recall-system), reads are shell commands (`tail`, `cat`, `grep`, …) detected by the rewrite hook. Reads made through an editor or the assistant's file-reading tool are invisible, so the rate is displayed as `≥` — a floor, not an exact figure. A high floor is still a reliable signal that the cap is too aggressive.
+- **TEE (approximate)**: in legacy [tee mode](../getting-started/configuration.md#recall-system), reads are shell commands (`tail`, `cat`, `grep`, …) observed by the rewrite hook before execution. Editor or assistant file-tool reads are invisible, denied commands are not counted, and the per-file dedup window is finite — so the `≥` rate is approximate, not exact. A high rate is still a reliable signal that the cap is too aggressive.
 
 Stats survive entry eviction and retention cleanup: calibration data is kept even after the underlying outputs are purged.
 

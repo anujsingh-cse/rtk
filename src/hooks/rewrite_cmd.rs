@@ -72,10 +72,13 @@ pub(crate) fn track_tee_read(cmd: &str) {
 }
 
 pub fn run(cmd: &str) -> anyhow::Result<()> {
-    track_tee_read(cmd);
     let (excluded, transparent_prefixes) = crate::core::config::hook_rewrite_params();
 
-    match evaluate(cmd, &excluded, &transparent_prefixes) {
+    let outcome = evaluate(cmd, &excluded, &transparent_prefixes);
+    if !matches!(outcome, RewriteOutcome::Deny) {
+        track_tee_read(cmd);
+    }
+    match outcome {
         RewriteOutcome::Allow(rewritten) => {
             print!("{}", rewritten);
             let _ = std::io::stdout().flush();
