@@ -39,6 +39,38 @@ struct LegacyTeeConfig {
     directory: Option<PathBuf>,
 }
 
+struct LegacyMapping {
+    mode: Option<crate::core::retriever::RecoveryMode>,
+    tee_max_files: Option<usize>,
+    tee_max_file_size: Option<usize>,
+    tee_directory: Option<PathBuf>,
+}
+
+/// The single source of truth for mapping a legacy `[tee]` section onto
+/// `[retriever]`, shared by `Config::load()` and `rtk config recall` so the
+/// two paths can never disagree on the same input.
+fn map_legacy_tee(
+    tee: &LegacyTeeConfig,
+    has_retriever: bool,
+    explicit_retriever_keys: &[String],
+) -> LegacyMapping {
+    use crate::core::retriever::RecoveryMode;
+    let explicit = |key: &str| explicit_retriever_keys.iter().any(|k| k == key);
+    let mode = if has_retriever {
+        None
+    } else if tee.enabled == Some(false) || tee.mode.as_deref() == Some("never") {
+        Some(RecoveryMode::Disabled)
+    } else {
+        Some(RecoveryMode::Tee)
+    };
+    LegacyMapping {
+        mode,
+        tee_max_files: tee.max_files.filter(|_| !explicit("tee_max_files")),
+        tee_max_file_size: tee.max_file_size.filter(|_| !explicit("tee_max_file_size")),
+        tee_directory: tee.directory.clone().filter(|_| !explicit("tee_directory")),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct HooksConfig {
     /// Commands to exclude from auto-rewrite (e.g. ["curl", "playwright"]).
@@ -230,37 +262,25 @@ impl Config {
             return;
         };
         use crate::core::retriever::RecoveryMode;
-        let explicit = |key: &str| explicit_retriever_keys.iter().any(|k| k == key);
+        let mapping = map_legacy_tee(&tee, has_retriever, explicit_retriever_keys);
         let r = &mut self.retriever;
-        if !has_retriever {
-            if tee.enabled == Some(false) || tee.mode.as_deref() == Some("never") {
-                r.mode = RecoveryMode::Disabled;
-            } else {
-                r.mode = RecoveryMode::Tee;
+        if let Some(mode) = mapping.mode {
+            r.mode = mode;
+            if mode == RecoveryMode::Tee {
                 self.migrated_from_legacy_tee = true;
             }
-            if tee.mode.as_deref() == Some("always") && !explicit("tee_on_success") {
-                r.tee_on_success = true;
-            }
         }
-        let mut merged = false;
-        if let Some(v) = tee.max_files {
-            if !explicit("tee_max_files") {
-                r.tee_max_files = v;
-                merged = true;
-            }
+        let merged = mapping.tee_max_files.is_some()
+            || mapping.tee_max_file_size.is_some()
+            || mapping.tee_directory.is_some();
+        if let Some(v) = mapping.tee_max_files {
+            r.tee_max_files = v;
         }
-        if let Some(v) = tee.max_file_size {
-            if !explicit("tee_max_file_size") {
-                r.tee_max_file_size = v;
-                merged = true;
-            }
+        if let Some(v) = mapping.tee_max_file_size {
+            r.tee_max_file_size = v;
         }
-        if let Some(d) = tee.directory {
-            if !explicit("tee_directory") {
-                r.tee_directory = Some(d);
-                merged = true;
-            }
+        if let Some(d) = mapping.tee_directory {
+            r.tee_directory = Some(d);
         }
         if has_retriever && merged {
             self.legacy_tee_fields_merged = true;
@@ -307,24 +327,45 @@ fn apply_recall_mode(content: &str, mode: crate::core::retriever::RecoveryMode) 
     doc["retriever"]["mode"] = toml_edit::value(mode_str);
 
     if let Some(legacy) = legacy.as_ref().and_then(|i| i.as_table_like()) {
-        for (old_key, new_key) in [
-            ("max_files", "tee_max_files"),
-            ("max_file_size", "tee_max_file_size"),
-            ("directory", "tee_directory"),
-        ] {
-            if let Some(v) = legacy.get(old_key).and_then(|i| i.as_value()) {
-                if doc["retriever"].get(new_key).is_none() {
-                    doc["retriever"][new_key] = toml_edit::Item::Value(v.clone());
-                }
-            }
+        let tee = LegacyTeeConfig {
+            enabled: legacy
+                .get("enabled")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_bool()),
+            mode: legacy
+                .get("mode")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            max_files: legacy
+                .get("max_files")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_integer())
+                .map(|n| n as usize),
+            max_file_size: legacy
+                .get("max_file_size")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_integer())
+                .map(|n| n as usize),
+            directory: legacy
+                .get("directory")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from),
+        };
+        let explicit_keys: Vec<String> = doc["retriever"]
+            .as_table_like()
+            .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+            .unwrap_or_default();
+        let mapping = map_legacy_tee(&tee, true, &explicit_keys);
+        if let Some(v) = mapping.tee_max_files {
+            doc["retriever"]["tee_max_files"] = toml_edit::value(v as i64);
         }
-        let was_always = legacy
-            .get("mode")
-            .and_then(|i| i.as_value())
-            .and_then(|v| v.as_str())
-            == Some("always");
-        if was_always && doc["retriever"].get("tee_on_success").is_none() {
-            doc["retriever"]["tee_on_success"] = toml_edit::value(true);
+        if let Some(v) = mapping.tee_max_file_size {
+            doc["retriever"]["tee_max_file_size"] = toml_edit::value(v as i64);
+        }
+        if let Some(d) = mapping.tee_directory {
+            doc["retriever"]["tee_directory"] = toml_edit::value(d.to_string_lossy().as_ref());
         }
     }
     Ok(doc.to_string())
@@ -572,16 +613,10 @@ enabled = false
     }
 
     #[test]
-    fn test_legacy_always_mode_maps_to_tee_on_success() {
+    fn test_legacy_always_mode_maps_to_plain_tee() {
         use crate::core::retriever::RecoveryMode;
         let config = Config::from_toml("[tee]\nmode = \"always\"\n").expect("valid");
         assert_eq!(config.retriever.mode, RecoveryMode::Tee);
-        assert!(
-            config.retriever.tee_on_success,
-            "always behavior must be preserved"
-        );
-        let plain = Config::from_toml("[tee]\nenabled = true\n").expect("valid");
-        assert!(!plain.retriever.tee_on_success);
     }
 
     #[test]
@@ -603,6 +638,47 @@ enabled = false
         assert!(!merged.migrated_from_legacy_tee);
         let clean = Config::from_toml("[retriever]\nmode = \"sqlite\"\n").expect("valid");
         assert!(!clean.legacy_tee_fields_merged);
+    }
+
+    #[test]
+    fn test_migration_paths_agree_on_every_legacy_shape() {
+        let modes = [
+            "",
+            "mode = \"failures\"\n",
+            "mode = \"always\"\n",
+            "mode = \"never\"\n",
+        ];
+        let enableds = ["", "enabled = true\n", "enabled = false\n"];
+        let retrievers = [
+            "",
+            "[retriever]\nretention_days = 90\n\n",
+            "[retriever]\ntee_max_files = 5\n\n",
+        ];
+        for m in modes {
+            for e in enableds {
+                for r in retrievers {
+                    let orig = format!("{r}[tee]\n{m}{e}max_files = 100\ndirectory = \"/big\"\n");
+                    let loaded = Config::from_toml(&orig).expect("load").retriever;
+                    let rewritten = apply_recall_mode(&orig, loaded.mode).expect("apply");
+                    let reloaded = Config::from_toml(&rewritten).expect("reload").retriever;
+                    assert_eq!(
+                        (
+                            loaded.mode,
+                            loaded.tee_max_files,
+                            loaded.tee_max_file_size,
+                            loaded.tee_directory.clone()
+                        ),
+                        (
+                            reloaded.mode,
+                            reloaded.tee_max_files,
+                            reloaded.tee_max_file_size,
+                            reloaded.tee_directory.clone()
+                        ),
+                        "Config::load and rtk config recall must agree on: {orig}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
