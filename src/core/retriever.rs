@@ -371,10 +371,13 @@ pub fn record_tee_recall(slug: &str, path: &str) {
     }
 }
 
-fn evict(conn: &Connection, cfg: &RetrieverConfig) {
+fn evict(conn: &Connection, cfg: &RetrieverConfig, keep_hash: &str) {
     if cfg.retention_days > 0 {
         let cutoff = now_secs() - (cfg.retention_days as i64) * 86_400;
-        let _ = conn.execute("DELETE FROM recall WHERE created_at < ?1", params![cutoff]);
+        let _ = conn.execute(
+            "DELETE FROM recall WHERE created_at < ?1 AND hash != ?2",
+            params![cutoff, keep_hash],
+        );
     }
     if cfg.max_entries > 0 {
         let count: i64 = conn
@@ -384,9 +387,10 @@ fn evict(conn: &Connection, cfg: &RetrieverConfig) {
         if excess > 0 {
             let _ = conn.execute(
                 "DELETE FROM recall WHERE rowid IN (
-                    SELECT rowid FROM recall ORDER BY rowid ASC LIMIT ?1
+                    SELECT rowid FROM recall WHERE hash != ?2
+                    ORDER BY created_at ASC, rowid ASC LIMIT ?1
                 )",
-                params![excess],
+                params![excess, keep_hash],
             );
         }
     }
@@ -472,7 +476,7 @@ fn store_inner(
     )
     .context("insert recall row")?;
     bump_stat(&conn, command, "sqlite", "elisions");
-    evict(&conn, cfg);
+    evict(&conn, cfg, &hash);
 
     Ok(StoredRef {
         hash,
@@ -824,6 +828,50 @@ mod tests {
     }
 
     #[test]
+    fn test_stored_hash_always_resolves_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = RetrieverConfig {
+            max_entries: 10,
+            retention_days: 0,
+            ..temp_cfg(dir.path())
+        };
+        for i in 0..6 {
+            store_inner(&cfg, format!("o{i}\n").as_bytes(), "cmd", Some(1), 1).unwrap();
+        }
+        cfg.max_entries = 3;
+        let stored = store_inner(&cfg, b"o0\n", "cmd", Some(1), 1).expect("re-store");
+        let conn = open(&cfg).unwrap();
+        assert!(
+            load_by_hash(&conn, &stored.hash).unwrap().is_some(),
+            "a hash returned by store() must resolve immediately"
+        );
+    }
+
+    #[test]
+    fn test_refreshed_entry_outlives_stale_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_entries: 5,
+            retention_days: 0,
+            ..temp_cfg(dir.path())
+        };
+        let old = store_inner(&cfg, b"first\n", "cmd", Some(1), 1).unwrap();
+        for i in 1..5 {
+            store_inner(&cfg, format!("mid{i}\n").as_bytes(), "cmd", Some(1), 1).unwrap();
+        }
+        let conn = open(&cfg).unwrap();
+        conn.execute("UPDATE recall SET created_at = created_at - 100 WHERE hash != ?1", params![old.hash]).unwrap();
+        conn.execute("UPDATE recall SET created_at = created_at + 50 WHERE hash = ?1", params![old.hash]).unwrap();
+        drop(conn);
+        store_inner(&cfg, b"newest\n", "cmd", Some(1), 1).unwrap();
+        let conn = open(&cfg).unwrap();
+        assert!(
+            load_by_hash(&conn, &old.hash).unwrap().is_some(),
+            "a refreshed (recent created_at) entry must not be evicted before stale ones"
+        );
+    }
+
+    #[test]
     fn test_eviction_same_second_keeps_newest_insertions() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = RetrieverConfig {
@@ -835,7 +883,7 @@ mod tests {
         insert_row(&conn, "zzz999999999", "old1");
         insert_row(&conn, "yyy888888888", "old2");
         insert_row(&conn, "aaa111111111", "newest");
-        evict(&conn, &cfg);
+        evict(&conn, &cfg, "aaa111111111");
         let newest: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM recall WHERE hash = 'aaa111111111'",
