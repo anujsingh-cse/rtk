@@ -191,6 +191,17 @@ fn open(cfg: &RetrieverConfig) -> Result<Connection> {
     Ok(conn)
 }
 
+fn open_existing(cfg: &RetrieverConfig) -> Result<Option<Connection>> {
+    let path = db_path(cfg)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+    init_schema(&conn)?;
+    Ok(Some(conn))
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS recall (
@@ -279,7 +290,9 @@ pub struct RecallStat {
 }
 
 fn stats_snapshot_with(cfg: &RetrieverConfig) -> Result<Vec<RecallStat>> {
-    let conn = open(cfg)?;
+    let Some(conn) = open_existing(cfg)? else {
+        return Ok(Vec::new());
+    };
     let mut stmt = conn.prepare("SELECT slug, mode, elisions, recalls FROM recall_stats")?;
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -321,6 +334,9 @@ pub fn stats_snapshot() -> Result<Vec<RecallStat>> {
 }
 
 pub fn record_tee_elision(cfg: &RetrieverConfig, slug: &str) {
+    if cfg.mode == RecoveryMode::Disabled {
+        return;
+    }
     if let Ok(conn) = open(cfg) {
         bump_stat(&conn, slug, "tee", "elisions");
     }
@@ -550,8 +566,16 @@ pub struct RecallArgs<'a> {
 
 pub fn run_recall(args: RecallArgs) -> Result<i32> {
     let cfg = Config::load().unwrap_or_default().retriever;
-    let conn = match open(&cfg) {
-        Ok(c) => c,
+    let conn = match open_existing(&cfg) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            if args.list {
+                println!("(no recall entries)");
+                return Ok(0);
+            }
+            eprintln!("rtk recall: no matching entry (try `rtk recall --list`)");
+            return Ok(1);
+        }
         Err(e) => {
             eprintln!("rtk recall: store unavailable: {e}");
             return Ok(1);
@@ -825,6 +849,19 @@ mod tests {
         let row = load_by_hash(&conn, &stored.hash).unwrap().unwrap();
         assert!(row.truncated);
         assert_eq!(decode(&row).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn test_read_paths_never_create_the_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = temp_cfg(dir.path());
+        let db = dir.path().join("recall_test.db");
+        let stats = stats_snapshot_with(&cfg).expect("snapshot on missing db");
+        assert!(stats.is_empty());
+        assert!(
+            !db.exists(),
+            "reading stats must never create the database file"
+        );
     }
 
     #[test]
