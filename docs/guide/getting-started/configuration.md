@@ -47,7 +47,6 @@ compression = true          # sqlite: gzip blobs (lossless)
 # database_path = "/custom/recall.db"
 tee_max_files = 20          # tee mode: rotation
 tee_max_file_size = 1048576 # tee mode: per-file cap
-# tee_on_success = true     # also store successful outputs (legacy "always")
 # tee_directory = "/custom/tee/dir"
 
 [telemetry]

@@ -411,7 +411,7 @@ fn recall_slug_is_public(slug: &str) -> bool {
 
 fn build_recall_stats(stats: &[crate::core::retriever::RecallStat]) -> serde_json::Value {
     let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut other = (0i64, 0i64);
+    let mut other: std::collections::BTreeMap<&str, (i64, i64)> = std::collections::BTreeMap::new();
     for s in stats {
         if recall_slug_is_public(&s.slug) {
             rows.push(serde_json::json!({
@@ -421,16 +421,17 @@ fn build_recall_stats(stats: &[crate::core::retriever::RecallStat]) -> serde_jso
                 "recalls": s.recalls,
             }));
         } else {
-            other.0 += s.elisions;
-            other.1 += s.recalls;
+            let e = other.entry(s.mode.as_str()).or_insert((0, 0));
+            e.0 += s.elisions;
+            e.1 += s.recalls;
         }
     }
-    if other != (0, 0) {
+    for (mode, (elisions, recalls)) in other {
         rows.push(serde_json::json!({
             "filter": "other",
-            "mode": "mixed",
-            "elisions": other.0,
-            "recalls": other.1,
+            "mode": mode,
+            "elisions": elisions,
+            "recalls": recalls,
         }));
     }
     serde_json::Value::Array(rows)
@@ -599,19 +600,22 @@ mod tests {
     }
 
     #[test]
-    fn test_recall_stats_unknown_or_suspicious_slugs_fold_into_other() {
+    fn test_recall_stats_unknown_or_suspicious_slugs_fold_into_other_per_mode() {
         let stats = vec![
             stat("mysecretproject", "sqlite", 3, 1),
             stat("grep__tmpEz7w0", "sqlite", 2, 0),
-            stat("a/b/path", "sqlite", 1, 0),
+            stat("a/b/path", "tee", 1, 0),
             stat(&"x".repeat(40), "sqlite", 1, 1),
         ];
         let v = build_recall_stats(&stats);
         let arr = v.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "everything folds into one row: {v}");
-        assert_eq!(arr[0]["filter"], "other");
-        assert_eq!(arr[0]["elisions"], 7);
-        assert_eq!(arr[0]["recalls"], 2);
+        assert_eq!(arr.len(), 2, "one other row per mode, never mixed: {v}");
+        let sqlite = arr.iter().find(|e| e["mode"] == "sqlite").unwrap();
+        let tee = arr.iter().find(|e| e["mode"] == "tee").unwrap();
+        assert_eq!(sqlite["filter"], "other");
+        assert_eq!(sqlite["elisions"], 6);
+        assert_eq!(sqlite["recalls"], 2);
+        assert_eq!(tee["elisions"], 1);
     }
 
     #[test]
