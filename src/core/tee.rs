@@ -27,13 +27,10 @@ fn store_hint(
 }
 
 pub fn tee_and_hint(raw: &str, command_slug: &str, exit_code: i32) -> Option<String> {
-    if raw.len() < MIN_FAILURE_BYTES {
+    if exit_code == 0 || raw.len() < MIN_FAILURE_BYTES {
         return None;
     }
     let (mode, cfg) = active()?;
-    if exit_code == 0 && !cfg.tee_on_success {
-        return None;
-    }
     match mode {
         RecoveryMode::Disabled => None,
         RecoveryMode::Tee => super::tee_file::tee_and_hint(&cfg, raw, command_slug)
@@ -72,11 +69,11 @@ pub fn force_tee_tail_hint(
         }
         RecoveryMode::Sqlite => {
             match retriever::store(&cfg, content.as_bytes(), command_slug, None, line_offset) {
-                Stored::Saved(s) => Some(format!(
+                Stored::Saved(s) if s.hidden_lines > 0 => Some(format!(
                     "[+{} hidden: rtk recall {}]",
                     s.hidden_lines, s.hash
                 )),
-                Stored::Unavailable | Stored::Empty => None,
+                Stored::Saved(_) | Stored::Unavailable | Stored::Empty => None,
             }
         }
     }

@@ -43,7 +43,6 @@ pub struct RetrieverConfig {
     pub tee_max_file_size: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tee_directory: Option<PathBuf>,
-    pub tee_on_success: bool,
 }
 
 impl Default for RetrieverConfig {
@@ -58,7 +57,6 @@ impl Default for RetrieverConfig {
             tee_max_files: DEFAULT_TEE_MAX_FILES,
             tee_max_file_size: DEFAULT_TEE_MAX_FILE_SIZE,
             tee_directory: None,
-            tee_on_success: false,
         }
     }
 }
@@ -461,7 +459,6 @@ fn store_inner(
     exit_code: Option<i32>,
     shown_upto: usize,
 ) -> Result<StoredRef> {
-    let total_lines = count_lines(content);
     let (payload, truncated) = if content.len() > cfg.max_entry_bytes {
         let cap = cfg.max_entry_bytes;
         let cut = content[..cap]
@@ -473,6 +470,7 @@ fn store_inner(
     } else {
         (content, false)
     };
+    let total_lines = count_lines(payload);
     let hash = content_hash(command, content);
     let (blob, codec): (Vec<u8>, &str) = if cfg.compression {
         match gzip(payload) {
@@ -592,6 +590,10 @@ pub struct RecallArgs<'a> {
 }
 
 pub fn run_recall(args: RecallArgs) -> Result<i32> {
+    if args.hash.is_none() && !args.list {
+        eprintln!("rtk recall: provide a <hash> (from a recovery hint) or --list");
+        return Ok(2);
+    }
     let cfg = Config::load().unwrap_or_default().retriever;
     let conn = match open_existing(&cfg) {
         Ok(Some(c)) => c,
@@ -654,6 +656,13 @@ pub fn run_recall(args: RecallArgs) -> Result<i32> {
         None => sliced,
     };
 
+    if out.is_empty() && row.truncated && args.grep.is_none() {
+        eprintln!(
+            "rtk recall: the requested lines were lost to the {}-byte storage cap (entry stored truncated)",
+            cfg.max_entry_bytes
+        );
+        return Ok(1);
+    }
     let stdout = std::io::stdout();
     let _ = stdout.lock().write_all(&out);
     mark_recalled(&conn, &row.hash, &row.command);
@@ -855,6 +864,43 @@ mod tests {
         let row = load_by_hash(&conn, &stored.hash).unwrap().unwrap();
         assert!(row.truncated);
         assert_eq!(decode(&row).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn test_hidden_lines_equal_recallable_lines_under_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_entry_bytes: 200,
+            ..temp_cfg(dir.path())
+        };
+        let content: Vec<u8> = (0..100)
+            .flat_map(|i| format!("line {i:03} padding\n").into_bytes())
+            .collect();
+        let stored = store_inner(&cfg, &content, "cmd", None, 5).unwrap();
+        let conn = open(&cfg).unwrap();
+        let row = load_by_hash(&conn, &stored.hash).unwrap().unwrap();
+        let recallable = count_lines(slice_from_line(&decode(&row).unwrap(), row.shown_upto));
+        assert_eq!(
+            stored.hidden_lines, recallable,
+            "the hint must promise exactly what recall can return"
+        );
+    }
+
+    #[test]
+    fn test_no_tail_hint_when_truncation_leaves_nothing_recallable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RetrieverConfig {
+            max_entry_bytes: 40,
+            ..temp_cfg(dir.path())
+        };
+        let content: Vec<u8> = (0..100)
+            .flat_map(|i| format!("line {i:03} padding\n").into_bytes())
+            .collect();
+        let stored = store_inner(&cfg, &content, "cmd", None, 50).unwrap();
+        assert_eq!(
+            stored.hidden_lines, 0,
+            "nothing recallable past shown_upto must yield zero hidden"
+        );
     }
 
     #[test]
